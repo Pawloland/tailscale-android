@@ -1,0 +1,8 @@
+rootProject.name = "tailscale-android"
+
+
+// Expose the Android app as module ':app' while keeping sources in the
+// android/ subdirectory. This lets Android Studio open the repository root
+// and treat the project inside `android/` as the Android app module.
+include(":app")
+project(":app").projectDir = file("android")
