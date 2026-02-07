@@ -182,6 +182,8 @@ build-unstripped-aar: tailscale.version $(GOBIN)/gomobile
 	rm -f $(ABS_UNSTRIPPED_AAR)
 	# The -linkmode=external -extldflags=-Wl,-z,max-page-size=16384 is specific to NDK 23
 	# to support 16kb page sizes.  Your mileage may vary with other NDK versions.
+	$(GOBIN)/gomobile version
+	./tool/go version
 	$(GOBIN)/gomobile bind -target android -androidapi 26 \
 	    -x \
 		-tags "$$(./build-tags.sh)" \
