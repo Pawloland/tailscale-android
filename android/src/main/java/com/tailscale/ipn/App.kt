@@ -300,6 +300,8 @@ class App : UninitializedApp(), libtailscale.AppContext, ViewModelStoreOwner {
 
   override fun getOSVersion(): String = Build.VERSION.RELEASE
 
+  override fun getSDKInt(): Long = Build.VERSION.SDK_INT.toLong()
+
   override fun isChromeOS(): Boolean {
     return packageManager.hasSystemFeature("android.hardware.type.pc")
   }
