@@ -111,6 +111,7 @@ func (s space) rangeToCIDRs(r ipRange) []netip.Prefix {
 // prefixToRange converts a netip.Prefix to an ipRange with Start and End addresses.
 // Start is the network address and End is the broadcast address.
 func (s space) prefixToRange(p netip.Prefix) ipRange {
+    p = p.Masked()
     start := s.addrToInt(p.Addr())
     hostBits := int(s.bits) - p.Bits()
     size := new(big.Int).Lsh(big.NewInt(1), uint(hostBits))
