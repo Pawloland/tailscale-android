@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/tailscale/tailscale-android/libtailscale/ifaceparse"
+	rangescalc "github.com/tailscale/tailscale-android/libtailscale/ranges_calc"
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
@@ -79,36 +80,27 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 	b.logger.Logf("updateTUN: changed")
 	defer b.logger.Logf("updateTUN: finished")
 
-	// Close previous tunnel(s).
-	// This is necessary for ChromeOS, native Android devices
-	// seem to handle seamless handover between tunnels correctly.
-	//
-	// TODO(eliasnaur): If seamless handover becomes a desirable feature, skip
-	// the closing on ChromeOS.
-	b.logger.Logf("updateTUN: closing old TUNs")
-	b.CloseTUNs()
-	b.logger.Logf("updateTUN: closed old TUNs")
+	if disableTUN := len(rcfg.LocalAddrs) == 0; disableTUN {
+		b.logger.Logf("updateTUN: closing old TUNs")
+		b.CloseTUNs()
+		b.logger.Logf("updateTUN: closed old TUNs")
 
-	// Since the previous tunnel(s) are closed, the [multiTUN] device is
-	// not operational until a new underlying tunnel is created and added,
-	// which may never happen in case of an error or an empty [router.Config].
-	//
-	// Therefore, to prevent deadlocks where a [multiTUN.Write] would
-	// block waiting for a new tunnel to be added, we bring the multiTUN
-	// device down on exit unless a new [tun.Device] is created and added
-	// successfully. See tailscale/tailscale#18679.
-	//
-	// TODO(nickkhyl): revisit and simplify the [multiTUN] implementation?
-	hasTunnel := false
-	defer func() {
-		if !hasTunnel && b.devices.Down() {
+		// Since the previous tunnel(s) are closed, the [multiTUN] device is
+		// not operational until a new underlying tunnel is created and added,
+		// which may never happen in case of an error or an empty [router.Config].
+		//
+		// Therefore, to prevent deadlocks where a [multiTUN.Write] would
+		// block waiting for a new tunnel to be added, we bring the multiTUN
+		// device down on exit unless a new [tun.Device] is created and added
+		// successfully. See tailscale/tailscale#18679.
+		//
+		// TODO(nickkhyl): revisit and simplify the [multiTUN] implementation?
+		if b.devices.Down() {
 			b.logger.Logf("updateTUN: tunnel brought down: %v", err)
 		}
-	}()
-
-	if len(rcfg.LocalAddrs) == 0 {
 		return nil
 	}
+
 	builder := vpnService.service.NewBuilder()
 	b.logger.Logf("updateTUN: got new builder")
 
@@ -134,25 +126,69 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 		b.logger.Logf("updateTUN: set nameservers")
 	}
 
-	for _, route := range rcfg.Routes {
-		// Normalize route address; Builder.addRoute does not accept non-zero masked bits.
-		route = route.Masked()
-		if err := builder.AddRoute(route.Addr().String(), int32(route.Bits())); err != nil {
-			return err
-		}
+	// Decide whether to use ExcludeRoute (API 33+) or compute included prefixes
+	// and pass them to AddRoute (older APIs).
+	useExclude := false
+	if sdk, err := b.appCtx.GetSDKInt(); err == nil && sdk >= 33 {
+		useExclude = true
 	}
 
-	for _, route := range rcfg.LocalRoutes {
-		addr := route.Addr()
-		if addr.IsLoopback() {
-			continue // Skip the loopback addresses since VpnService throws an exception for those (both IPv4 and IPv6) - see https://android.googlesource.com/platform/frameworks/base/+/c741553/core/java/android/net/VpnService.java#303
+	if useExclude {
+		// For API 33+, use ExcludeRoute for LocalRoutes and AddRoute for Routes.
+		for _, route := range rcfg.Routes {
+			// Normalize route address; Builder.addRoute does not accept non-zero masked bits.
+			route = route.Masked()
+			if err := builder.AddRoute(route.Addr().String(), int32(route.Bits())); err != nil {
+				return err
+			}
 		}
-		route = route.Masked()
-		if err := builder.ExcludeRoute(route.Addr().String(), int32(route.Bits())); err != nil {
+
+		for _, route := range rcfg.LocalRoutes {
+			addr := route.Addr()
+			if addr.IsLoopback() {
+				continue // Skip the loopback addresses since VpnService throws an exception for those (both IPv4 and IPv6) - see https://android.googlesource.com/platform/frameworks/base/+/c741553/core/java/android/net/VpnService.java#303
+			}
+			route = route.Masked()
+			if err := builder.ExcludeRoute(route.Addr().String(), int32(route.Bits())); err != nil {
+				return err
+			}
+		}
+
+		b.logger.Logf("updateTUN: added %d routes (exclude-mode), localRoutes=%d", len(rcfg.Routes), len(rcfg.LocalRoutes))
+	} else {
+		// Older APIs: compute allowed-minus-disallowed prefixes and AddRoute them.
+		prefixesV4, prefixesV6, err := rangescalc.Calculate(rcfg.Routes, rcfg.LocalRoutes)
+		if err != nil {
+			b.logger.Logf("updateTUN: route calculation error: %v", err)
 			return err
 		}
+
+		for _, route := range prefixesV4 {
+			route = route.Masked()
+			if err := builder.AddRoute(route.Addr().String(), int32(route.Bits())); err != nil {
+				return err
+			}
+		}
+		for _, route := range prefixesV6 {
+			route = route.Masked()
+			if err := builder.AddRoute(route.Addr().String(), int32(route.Bits())); err != nil {
+				return err
+			}
+		}
+
+		b.logger.Logf(
+			"updateTUN: added routes: v4=%d v6=%d total=%d (input routes=%d, localRoutes=%d)",
+			len(prefixesV4),
+			len(prefixesV6),
+			len(prefixesV4)+len(prefixesV6),
+			len(rcfg.Routes),
+			len(rcfg.LocalRoutes),
+		)
+		b.logger.Logf("updateTUN: input routes: %v", rcfg.Routes)
+		b.logger.Logf("updateTUN: input local routes: %v", rcfg.LocalRoutes)
+		b.logger.Logf("updateTUN: effective routes v4: %v", prefixesV4)
+		b.logger.Logf("updateTUN: effective routes v6: %v", prefixesV6)
 	}
-	b.logger.Logf("updateTUN: added %d routes", len(rcfg.Routes))
 
 	for _, addr := range rcfg.LocalAddrs {
 		if err := builder.AddAddress(addr.Addr().String(), int32(addr.Bits())); err != nil {
@@ -199,7 +235,6 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 	b.logger.Logf("updateTUN: created TUN device")
 
 	b.devices.add(tunDev)
-	hasTunnel = true
 	b.logger.Logf("updateTUN: added TUN device")
 
 	if b.devices.Up() {
